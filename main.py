@@ -140,8 +140,30 @@ def classify_order(order: dict) -> str:
                 k, v = pair.split("=", 1)
                 utm[k.lower()] = v.lower()
 
+    # Fallback: some checkouts (e.g. third-party checkouts like Razorpay
+    # Magic Checkout) bypass Shopify's native checkout, so landing_site
+    # never gets populated. In that case UTM params are often captured
+    # into note_attributes (custom checkout fields) instead.
+    note_attrs = order.get("note_attributes") or []
+    note_map = {}
+    for attr in note_attrs:
+        name = (attr.get("name") or "").lower()
+        value = (attr.get("value") or "").lower()
+        note_map[name] = value
+
+    for key in ("utm_source", "utm_medium", "utm_campaign", "gclid", "fbclid"):
+        if key not in utm and key in note_map and note_map[key]:
+            utm[key] = note_map[key]
+
     utm_medium = utm.get("utm_medium", "")
     utm_source = utm.get("utm_source", "")
+    gclid = utm.get("gclid", "")
+    fbclid = utm.get("fbclid", "")
+
+    # A click ID (gclid/fbclid) is a strong signal the visit came from a
+    # paid ad click, regardless of what utm_medium says.
+    if gclid or fbclid:
+        return "Paid Ads"
 
     paid_mediums = {"cpc", "ppc", "paid", "ads", "pmax"}
     if any(pm in utm_medium for pm in paid_mediums):
@@ -204,7 +226,7 @@ async def api_orders(shop: str = None, days: int = 60, authorized: bool = Depend
         "status": "any",
         "limit": 250,
         "created_at_min": since,
-        "fields": "id,name,created_at,total_price,currency,source_name,landing_site,referring_site,financial_status",
+        "fields": "id,name,created_at,total_price,currency,source_name,landing_site,referring_site,financial_status,note_attributes",
     }
 
     headers = {"X-Shopify-Access-Token": token}
