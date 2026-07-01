@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Order Source Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #171a21;
+    --border: #262b36;
+    --text: #e8eaed;
+    --muted: #9aa2af;
+    --accent: #5b8def;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 32px;
+  }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
+  .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 24px; }
+  select, input[type=text] {
+    background: var(--card); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 12px; font-size: 14px;
+  }
+  button {
+    background: var(--accent); color: white; border: none; border-radius: 8px;
+    padding: 8px 16px; font-size: 14px; cursor: pointer;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 16px 0; color: var(--muted); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .stat { font-size: 28px; font-weight: 700; }
+  .error { color: #f87171; padding: 16px; background: #2a1515; border-radius: 8px; }
+  .loading { color: var(--muted); padding: 20px; }
+</style>
+</head>
+<body>
+
+<h1>Order Source Dashboard</h1>
+<div class="sub" id="shopLabel">Loading...</div>
+
+<div class="controls">
+  <label style="color:var(--muted); font-size:14px;">Window:</label>
+  <select id="daysSelect">
+    <option value="7">Last 7 days</option>
+    <option value="30">Last 30 days</option>
+    <option value="60" selected>Last 60 days</option>
+    <option value="90">Last 90 days</option>
+    <option value="365">Last 365 days</option>
+  </select>
+  <button onclick="loadData()">Refresh</button>
+</div>
+
+<div id="content">
+  <div class="loading">Loading orders…</div>
+</div>
+
+<script>
+async function loadData() {
+  const days = document.getElementById('daysSelect').value;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">Loading orders…</div>';
+
+  try {
+    const res = await fetch(`/api/orders?days=${days}`);
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(errText);
+    }
+    const data = await res.json();
+    render(data);
+  } catch (err) {
+    content.innerHTML = `<div class="error">Error loading orders: ${err.message}</div>`;
+  }
+}
+
+function render(data) {
+  document.getElementById('shopLabel').textContent =
+    `${data.shop} — ${data.order_count} orders`;
+
+  const channels = Object.keys(data.channel_totals).sort(
+    (a, b) => data.channel_totals[b].orders - data.channel_totals[a].orders
+  );
+
+  const totalRevenue = channels.reduce((sum, c) => sum + data.channel_totals[c].revenue, 0);
+
+  let rows = channels.map(c => {
+    const t = data.channel_totals[c];
+    const pct = data.order_count ? ((t.orders / data.order_count) * 100).toFixed(1) : 0;
+    return `<tr>
+      <td>${c}</td>
+      <td>${t.orders}</td>
+      <td>${pct}%</td>
+      <td>${t.revenue.toLocaleString(undefined, {style:'currency', currency:'USD'})}</td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('content').innerHTML = `
+    <div class="grid">
+      <div class="card">
+        <h2>Total Orders</h2>
+        <div class="stat">${data.order_count}</div>
+      </div>
+      <div class="card">
+        <h2>Total Revenue</h2>
+        <div class="stat">${totalRevenue.toLocaleString(undefined, {style:'currency', currency:'USD'})}</div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h2>Orders by Channel</h2>
+        <canvas id="channelChart" height="220"></canvas>
+      </div>
+      <div class="card">
+        <h2>Breakdown</h2>
+        <table>
+          <thead><tr><th>Channel</th><th>Orders</th><th>%</th><th>Revenue</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  const ctx = document.getElementById('channelChart');
+  new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: channels,
+      datasets: [{
+        data: channels.map(c => data.channel_totals[c].orders),
+        backgroundColor: ['#5b8def','#f59e0b','#10b981','#ef4444','#a78bfa','#f472b6','#22d3ee','#84cc16'],
+        borderWidth: 0,
+      }]
+    },
+    options: {
+      plugins: { legend: { position: 'bottom', labels: { color: '#e8eaed' } } }
+    }
+  });
+}
+
+loadData();
+</script>
+</body>
+</html>
