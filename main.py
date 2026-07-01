@@ -1,7 +1,6 @@
 import os
 import json
 import secrets
-import base64
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
@@ -149,8 +148,8 @@ def classify_order(order: dict) -> str:
         if key not in utm and key in note_map and note_map[key]:
             utm[key] = note_map[key]
 
-    utm_medium = utm.get("utm_medium", "")
-    utm_source = utm.get("utm_source", "")
+    utm_medium = utm.get("utm_medium", "").strip()
+    utm_source = utm.get("utm_source", "").strip()
     gclid = utm.get("gclid", "")
     fbclid = utm.get("fbclid", "")
     ttclid = utm.get("ttclid", "")
@@ -219,7 +218,13 @@ def classify_order(order: dict) -> str:
 # ---------------------------------------------------------------------------
 
 @app.get("/api/orders")
-async def api_orders(shop: str = None, days: int = 60, authorized: bool = Depends(require_auth)):
+async def api_orders(
+    shop: str = None,
+    days: int = 60,
+    start_date: str = None,   # e.g. "2026-06-01"
+    end_date: str = None,     # e.g. "2026-06-30"
+    authorized: bool = Depends(require_auth),
+):
     shop = shop or SHOPIFY_STORE
     if not shop:
         raise HTTPException(400, "No shop configured")
@@ -233,7 +238,21 @@ async def api_orders(shop: str = None, days: int = 60, authorized: bool = Depend
             f"No access token for {shop}. Visit {APP_URL}/install?shop={shop} to install the app first.",
         )
 
-    since = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+    # Resolve date window: explicit start_date/end_date takes priority over `days`
+    if start_date:
+        try:
+            since = datetime.fromisoformat(start_date).isoformat() + "Z"
+        except ValueError:
+            raise HTTPException(400, "start_date must be in YYYY-MM-DD format")
+    else:
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+
+    until = None
+    if end_date:
+        try:
+            until = (datetime.fromisoformat(end_date) + timedelta(days=1)).isoformat() + "Z"
+        except ValueError:
+            raise HTTPException(400, "end_date must be in YYYY-MM-DD format")
 
     orders = []
     url = f"https://{shop}/admin/api/{API_VERSION}/orders.json"
@@ -243,6 +262,8 @@ async def api_orders(shop: str = None, days: int = 60, authorized: bool = Depend
         "created_at_min": since,
         "fields": "id,name,created_at,total_price,currency,source_name,landing_site,referring_site,financial_status,note_attributes",
     }
+    if until:
+        params["created_at_max"] = until
 
     headers = {"X-Shopify-Access-Token": token}
 
@@ -266,25 +287,42 @@ async def api_orders(shop: str = None, days: int = 60, authorized: bool = Depend
 
     results = []
     channel_totals = {}
+    daily_totals = {}  # { "2026-06-01": { "orders": N, "revenue": X, "channels": {...} } }
+
     for o in orders:
         channel = classify_order(o)
         price = float(o.get("total_price") or 0)
-        channel_totals[channel] = channel_totals.get(channel, {"orders": 0, "revenue": 0.0})
+        created_at = o.get("created_at") or ""
+        day_key = created_at[:10] if created_at else "unknown"
+
+        channel_totals.setdefault(channel, {"orders": 0, "revenue": 0.0})
         channel_totals[channel]["orders"] += 1
         channel_totals[channel]["revenue"] += price
+
+        day_entry = daily_totals.setdefault(day_key, {"orders": 0, "revenue": 0.0, "channels": {}})
+        day_entry["orders"] += 1
+        day_entry["revenue"] += price
+        day_entry["channels"].setdefault(channel, {"orders": 0, "revenue": 0.0})
+        day_entry["channels"][channel]["orders"] += 1
+        day_entry["channels"][channel]["revenue"] += price
+
         results.append({
             "id": o.get("id"),
             "name": o.get("name"),
-            "created_at": o.get("created_at"),
+            "created_at": created_at,
             "total_price": price,
             "currency": o.get("currency"),
             "channel": channel,
         })
 
+    daily_totals_sorted = dict(sorted(daily_totals.items()))
+
     return JSONResponse({
         "shop": shop,
         "order_count": len(results),
+        "date_range": {"start": since, "end": until},
         "channel_totals": channel_totals,
+        "daily_totals": daily_totals_sorted,
         "orders": results,
     })
 
