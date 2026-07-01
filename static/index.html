@@ -23,20 +23,24 @@
   }
   h1 { font-size: 22px; margin-bottom: 4px; }
   .sub { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
-  .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 24px; }
-  select, input[type=text] {
+  .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 24px; flex-wrap: wrap; }
+  select, input[type=text], input[type=date] {
     background: var(--card); color: var(--text); border: 1px solid var(--border);
     border-radius: 8px; padding: 8px 12px; font-size: 14px;
   }
+  input[type=date] { color-scheme: dark; }
   button {
     background: var(--accent); color: white; border: none; border-radius: 8px;
     padding: 8px 16px; font-size: 14px; cursor: pointer;
   }
+  .custom-range { display: none; align-items: center; gap: 8px; }
+  .custom-range.active { display: flex; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
   @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
   .card {
     background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px;
   }
+  .card.full { grid-column: 1 / -1; }
   .card h2 { font-size: 15px; margin: 0 0 16px 0; color: var(--muted); font-weight: 600; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
@@ -44,6 +48,19 @@
   .stat { font-size: 28px; font-weight: 700; }
   .error { color: #f87171; padding: 16px; background: #2a1515; border-radius: 8px; }
   .loading { color: var(--muted); padding: 20px; }
+  .day-row { cursor: pointer; }
+  .day-row:hover { background: #1d212b; }
+  .day-detail { display: none; }
+  .day-detail.open { display: table-row; }
+  .day-detail td { padding: 0; }
+  .day-detail-inner { padding: 10px 6px 16px 20px; }
+  .chip {
+    display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px;
+    background: #1d212b; border: 1px solid var(--border); margin: 2px 6px 2px 0; color: var(--muted);
+  }
+  .badge-paid { color: #f59e0b; }
+  .badge-organic { color: #10b981; }
+  .scroll-table { max-height: 420px; overflow-y: auto; }
 </style>
 </head>
 <body>
@@ -53,13 +70,21 @@
 
 <div class="controls">
   <label style="color:var(--muted); font-size:14px;">Window:</label>
-  <select id="daysSelect">
+  <select id="daysSelect" onchange="handleWindowChange()">
     <option value="7">Last 7 days</option>
     <option value="30">Last 30 days</option>
     <option value="60" selected>Last 60 days</option>
     <option value="90">Last 90 days</option>
     <option value="365">Last 365 days</option>
+    <option value="custom">Custom range</option>
   </select>
+
+  <div class="custom-range" id="customRange">
+    <input type="date" id="startDate" />
+    <span style="color:var(--muted);">to</span>
+    <input type="date" id="endDate" />
+  </div>
+
   <button onclick="loadData()">Refresh</button>
 </div>
 
@@ -68,13 +93,54 @@
 </div>
 
 <script>
+function handleWindowChange() {
+  const val = document.getElementById('daysSelect').value;
+  const customRange = document.getElementById('customRange');
+  if (val === 'custom') {
+    customRange.classList.add('active');
+    if (!document.getElementById('endDate').value) {
+      const today = new Date();
+      const start = new Date();
+      start.setDate(today.getDate() - 30);
+      document.getElementById('endDate').value = today.toISOString().slice(0, 10);
+      document.getElementById('startDate').value = start.toISOString().slice(0, 10);
+    }
+  } else {
+    customRange.classList.remove('active');
+  }
+}
+
+function formatINR(amount) {
+  return amount.toLocaleString('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
+}
+
+function buildQuery() {
+  const windowVal = document.getElementById('daysSelect').value;
+  if (windowVal === 'custom') {
+    const start = document.getElementById('startDate').value;
+    const end = document.getElementById('endDate').value;
+    if (!start || !end) {
+      throw new Error('Please pick both a start and end date');
+    }
+    return `start_date=${start}&end_date=${end}`;
+  }
+  return `days=${windowVal}`;
+}
+
 async function loadData() {
-  const days = document.getElementById('daysSelect').value;
   const content = document.getElementById('content');
   content.innerHTML = '<div class="loading">Loading orders…</div>';
 
+  let query;
   try {
-    const res = await fetch(`/api/orders?days=${days}`);
+    query = buildQuery();
+  } catch (err) {
+    content.innerHTML = `<div class="error">${err.message}</div>`;
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/orders?${query}`);
     if (!res.ok) {
       const errText = await res.text();
       throw new Error(errText);
@@ -103,9 +169,42 @@ function render(data) {
       <td>${c}</td>
       <td>${t.orders}</td>
       <td>${pct}%</td>
-      <td>${t.revenue.toLocaleString(undefined, {style:'currency', currency:'USD'})}</td>
+      <td>${formatINR(t.revenue)}</td>
     </tr>`;
   }).join('');
+
+  // Daily breakdown
+  const dailyTotals = data.daily_totals || {};
+  const days = Object.keys(dailyTotals).filter(d => d !== 'unknown').sort();
+
+  let dailyRows = days.map((day, idx) => {
+    const d = dailyTotals[day];
+    const dayChannels = Object.keys(d.channels).sort(
+      (a, b) => d.channels[b].revenue - d.channels[a].revenue
+    );
+    const chips = dayChannels.map(c => {
+      const isPaid = c.toLowerCase().includes('paid');
+      const cls = isPaid ? 'badge-paid' : 'badge-organic';
+      return `<span class="chip"><span class="${cls}">${c}</span>: ${d.channels[c].orders} orders, ${formatINR(d.channels[c].revenue)}</span>`;
+    }).join('');
+
+    return `
+      <tr class="day-row" onclick="toggleDay(${idx})">
+        <td>${day}</td>
+        <td>${d.orders}</td>
+        <td>${formatINR(d.revenue)}</td>
+        <td>${dayChannels.length} channel${dayChannels.length !== 1 ? 's' : ''}</td>
+      </tr>
+      <tr class="day-detail" id="day-detail-${idx}">
+        <td colspan="4">
+          <div class="day-detail-inner">${chips}</div>
+        </td>
+      </tr>`;
+  }).join('');
+
+  if (!dailyRows) {
+    dailyRows = `<tr><td colspan="4" style="color:var(--muted);">No orders in this range</td></tr>`;
+  }
 
   document.getElementById('content').innerHTML = `
     <div class="grid">
@@ -115,7 +214,7 @@ function render(data) {
       </div>
       <div class="card">
         <h2>Total Revenue</h2>
-        <div class="stat">${totalRevenue.toLocaleString(undefined, {style:'currency', currency:'inr'})}</div>
+        <div class="stat">${formatINR(totalRevenue)}</div>
       </div>
     </div>
     <div class="grid">
@@ -129,6 +228,23 @@ function render(data) {
           <thead><tr><th>Channel</th><th>Orders</th><th>%</th><th>Revenue</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card full">
+        <h2>Daily Revenue by Channel</h2>
+        <canvas id="dailyChart" height="100"></canvas>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card full">
+        <h2>Day-wise Sessions / Orders (click a row for channel split)</h2>
+        <div class="scroll-table">
+          <table>
+            <thead><tr><th>Date</th><th>Orders</th><th>Revenue</th><th>Channels</th></tr></thead>
+            <tbody>${dailyRows}</tbody>
+          </table>
+        </div>
       </div>
     </div>
   `;
@@ -148,6 +264,45 @@ function render(data) {
       plugins: { legend: { position: 'bottom', labels: { color: '#e8eaed' } } }
     }
   });
+
+  if (days.length) {
+    const paidDaily = days.map(day => {
+      const d = dailyTotals[day];
+      return Object.keys(d.channels)
+        .filter(c => c.toLowerCase().includes('paid'))
+        .reduce((sum, c) => sum + d.channels[c].revenue, 0);
+    });
+    const organicDaily = days.map(day => {
+      const d = dailyTotals[day];
+      return Object.keys(d.channels)
+        .filter(c => !c.toLowerCase().includes('paid'))
+        .reduce((sum, c) => sum + d.channels[c].revenue, 0);
+    });
+
+    const dctx = document.getElementById('dailyChart');
+    new Chart(dctx, {
+      type: 'bar',
+      data: {
+        labels: days,
+        datasets: [
+          { label: 'Paid', data: paidDaily, backgroundColor: '#f59e0b' },
+          { label: 'Organic / Other', data: organicDaily, backgroundColor: '#10b981' },
+        ]
+      },
+      options: {
+        scales: {
+          x: { stacked: true, ticks: { color: '#9aa2af' }, grid: { color: '#262b36' } },
+          y: { stacked: true, ticks: { color: '#9aa2af' }, grid: { color: '#262b36' } },
+        },
+        plugins: { legend: { position: 'bottom', labels: { color: '#e8eaed' } } }
+      }
+    });
+  }
+}
+
+function toggleDay(idx) {
+  const row = document.getElementById(`day-detail-${idx}`);
+  row.classList.toggle('open');
 }
 
 loadData();
