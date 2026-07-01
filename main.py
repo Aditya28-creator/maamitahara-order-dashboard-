@@ -47,7 +47,6 @@ def get_token_for_shop(shop: str):
 
 
 def require_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    # If no dashboard credentials are configured, skip auth (local dev)
     if not DASHBOARD_USER or not DASHBOARD_PASS:
         return True
     correct_user = secrets.compare_digest(credentials.username, DASHBOARD_USER)
@@ -131,7 +130,6 @@ def classify_order(order: dict) -> str:
     landing_site = order.get("landing_site") or ""
     referring_site = (order.get("referring_site") or "").lower()
 
-    # Parse UTM params out of landing_site query string
     utm = {}
     if "?" in landing_site:
         query = landing_site.split("?", 1)[1]
@@ -140,10 +138,6 @@ def classify_order(order: dict) -> str:
                 k, v = pair.split("=", 1)
                 utm[k.lower()] = v.lower()
 
-    # Fallback: some checkouts (e.g. third-party checkouts like Razorpay
-    # Magic Checkout) bypass Shopify's native checkout, so landing_site
-    # never gets populated. In that case UTM params are often captured
-    # into note_attributes (custom checkout fields) instead.
     note_attrs = order.get("note_attributes") or []
     note_map = {}
     for attr in note_attrs:
@@ -151,7 +145,7 @@ def classify_order(order: dict) -> str:
         value = (attr.get("value") or "").lower()
         note_map[name] = value
 
-    for key in ("utm_source", "utm_medium", "utm_campaign", "gclid", "fbclid"):
+    for key in ("utm_source", "utm_medium", "utm_campaign", "gclid", "fbclid", "ttclid", "msclkid"):
         if key not in utm and key in note_map and note_map[key]:
             utm[key] = note_map[key]
 
@@ -159,18 +153,39 @@ def classify_order(order: dict) -> str:
     utm_source = utm.get("utm_source", "")
     gclid = utm.get("gclid", "")
     fbclid = utm.get("fbclid", "")
+    ttclid = utm.get("ttclid", "")
+    msclkid = utm.get("msclkid", "")
 
-    # A click ID (gclid/fbclid) is a strong signal the visit came from a
-    # paid ad click, regardless of what utm_medium says.
-    if gclid or fbclid:
-        return "Paid Ads"
+    def platform_label(src: str) -> str:
+        mapping = {
+            "google": "Google", "googleads": "Google", "adwords": "Google",
+            "facebook": "Meta/Facebook", "instagram": "Meta/Instagram", "meta": "Meta",
+            "tiktok": "TikTok", "pinterest": "Pinterest", "bing": "Bing",
+            "twitter": "X/Twitter", "x.com": "X/Twitter", "snapchat": "Snapchat",
+            "linkedin": "LinkedIn", "yahoo": "Yahoo",
+        }
+        for key_, label in mapping.items():
+            if key_ in src:
+                return label
+        return src.title() if src else "Unknown"
+
+    if gclid:
+        return "Paid Ads (Google)"
+    if fbclid:
+        return "Paid Ads (Meta/Facebook)"
+    if ttclid:
+        return "Paid Ads (TikTok)"
+    if msclkid:
+        return "Paid Ads (Bing/Microsoft)"
 
     paid_mediums = {"cpc", "ppc", "paid", "ads", "pmax"}
     if any(pm in utm_medium for pm in paid_mediums):
-        return "Paid Ads"
+        platform = platform_label(utm_source) if utm_source else "Unknown"
+        return f"Paid Ads ({platform})"
 
     if "organic" in utm_medium:
-        return "Organic Search"
+        platform = platform_label(utm_source) if utm_source else "Unknown"
+        return f"Organic Search ({platform})"
 
     if utm_medium in {"email", "newsletter"}:
         return "Email"
@@ -180,20 +195,20 @@ def classify_order(order: dict) -> str:
 
     social_sources = {"facebook", "instagram", "tiktok", "pinterest", "twitter", "x.com", "snapchat", "linkedin"}
     if utm_source and any(s in utm_source for s in social_sources) and not utm_medium:
-        return "Organic Social"
+        return f"Organic Social ({platform_label(utm_source)})"
 
     search_domains = {"google", "bing", "yahoo", "duckduckgo"}
     if utm_source and any(s in utm_source for s in search_domains) and not utm_medium:
-        return "Organic Search"
+        return f"Organic Search ({platform_label(utm_source)})"
 
     if not landing_site and not referring_site:
         return "Direct"
 
     if referring_site and not utm:
         if any(s in referring_site for s in search_domains):
-            return "Organic Search"
+            return f"Organic Search ({platform_label(referring_site)})"
         if any(s in referring_site for s in social_sources):
-            return "Organic Social"
+            return f"Organic Social ({platform_label(referring_site)})"
         return "Referral/Affiliate"
 
     return "Other"
@@ -239,7 +254,6 @@ async def api_orders(shop: str = None, days: int = 60, authorized: bool = Depend
             payload = resp.json()
             orders.extend(payload.get("orders", []))
 
-            # Handle pagination via Link header
             link = resp.headers.get("Link", "")
             next_url = None
             if link:
@@ -248,7 +262,7 @@ async def api_orders(shop: str = None, days: int = 60, authorized: bool = Depend
                     if 'rel="next"' in part:
                         next_url = part.split(";")[0].strip().strip("<>")
             url = next_url
-            params = None  # next_url already has query params baked in
+            params = None
 
     results = []
     channel_totals = {}
