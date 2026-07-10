@@ -267,16 +267,177 @@ def classify_order(order: dict) -> str:
 # whenever CLARITY_API_TOKEN was first configured. Days before that (or any
 # day the sync genuinely couldn't reach Clarity after retries) simply have
 # no entry — Clarity has no historical export to backfill from anyway.
+#
+# One API call already returns EVERY metric Clarity tracks (Traffic, Scroll
+# Depth, Engagement Time, Referrer URL, Channel, Source, Campaign, Dead/Rage
+# Click Count, Excessive Scroll, Quickback Click, Script/Error Click Count) —
+# we just need to read all of it instead of only the "Traffic" block. This
+# costs the same 1 request against the 10/project/day quota.
+#
+# NOTE: Microsoft's docs don't publish the exact field names inside every
+# metric's "information" rows (only "Traffic" has a documented sample). The
+# extraction below is written defensively (tries several likely key names,
+# skips gracefully if a metric or field isn't present) and the raw payload
+# from the most recent sync is cached under the "_last_clarity_raw" key so
+# you can inspect real field names via /api/sessions/debug-clarity-raw and
+# we can tighten the mapping if something doesn't line up.
 # ---------------------------------------------------------------------------
 
-async def fetch_clarity_device_sessions(num_days: int = 1) -> dict:
+_COUNT_KEYS = ["totalSessionCount", "sessionCount", "SessionCount", "count", "Count"]
+_PERCENT_KEYS = [
+    "sessionsWithMetricPercentage", "percentage", "Percentage", "rate", "Rate",
+]
+_LABEL_KEYS = [
+    "Referrer", "ReferrerUrl", "referrerUrl", "ReferrerURL", "Channel", "Source",
+    "Campaign", "Url", "URL", "PageTitle", "Country", "CountryRegion",
+    "Country/Region", "Browser", "OS", "Device",
+]
+
+
+def _numeric(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(row: dict, keys: list):
+    for k in keys:
+        if k in row and row[k] is not None:
+            return row[k]
+    return None
+
+
+def _extract_top_list(rows: list, limit: int = 6) -> list:
+    """Turns a list of metric rows into [{label, sessions}], sorted desc, top N."""
+    items = []
+    for row in rows:
+        label = _first_present(row, _LABEL_KEYS)
+        if label is None:
+            for v in row.values():
+                if isinstance(v, str):
+                    label = v
+                    break
+        count = _numeric(_first_present(row, _COUNT_KEYS)) or 0
+        bots = _numeric(row.get("totalBotSessionCount")) or 0
+        sessions = max(int(count - bots), 0)
+        if label:
+            items.append({"label": label, "sessions": sessions})
+    items.sort(key=lambda x: x["sessions"], reverse=True)
+    return items[:limit]
+
+
+def _extract_rate_metric(rows: list) -> dict:
+    """Best-effort {"pct": float|None, "sessions": int} for click/friction metrics."""
+    total_sessions = 0
+    pct_values = []
+    for row in rows:
+        s = _numeric(_first_present(row, _COUNT_KEYS))
+        if s:
+            total_sessions += int(s)
+        for key in _PERCENT_KEYS:
+            if key in row:
+                v = _numeric(row[key])
+                if v is not None:
+                    pct_values.append(v)
+    pct = round(sum(pct_values) / len(pct_values), 2) if pct_values else None
+    return {"pct": pct, "sessions": total_sessions}
+
+
+def summarize_clarity_payload(payload: list) -> dict:
+    metrics_by_name = {}
+    for m in payload:
+        name = m.get("metricName")
+        if name:
+            metrics_by_name.setdefault(name, []).extend(m.get("information", []))
+
+    # --- Traffic: total/device sessions + pages-per-session (documented field) ---
+    total = desktop = mobile = other = 0
+    weighted_pages = 0.0
+    for row in metrics_by_name.get("Traffic", []):
+        sessions = int(row.get("totalSessionCount", 0) or 0)
+        bots = int(row.get("totalBotSessionCount", 0) or 0)
+        real_sessions = max(sessions - bots, 0)
+        device = (row.get("Device") or "").strip().lower()
+
+        total += real_sessions
+        if device == "desktop":
+            desktop += real_sessions
+        elif device == "mobile":
+            mobile += real_sessions
+        else:
+            other += real_sessions  # tablet, other, unknown
+
+        pps = row.get("PagesPerSessionPercentage")
+        if pps is not None:
+            weighted_pages += real_sessions * float(pps)
+
+    result = {
+        "total_sessions": total,
+        "desktop_sessions": desktop,
+        "mobile_sessions": mobile,
+        "other_sessions": other,
+        "pages_per_session": round(weighted_pages / total, 2) if total else None,
+    }
+
+    # --- Scroll depth / engagement time: best-effort, metric name may vary ---
+    for metric_name, out_key in [
+        ("ScrollDepth", "scroll_depth_pct"), ("Scroll Depth", "scroll_depth_pct"),
+        ("EngagementTime", "active_time_seconds"), ("Engagement Time", "active_time_seconds"),
+    ]:
+        rows = metrics_by_name.get(metric_name)
+        if not rows or out_key in result:
+            continue
+        vals = []
+        for row in rows:
+            for v in row.values():
+                n = _numeric(v)
+                if n is not None and n > 0:
+                    vals.append(n)
+        if vals:
+            result[out_key] = round(sum(vals) / len(vals), 2)
+
+    # --- Top-N breakdowns: referrers, channels, sources, campaigns, pages, etc ---
+    list_metrics = {
+        "ReferrerURL": "top_referrers", "Referrer URL": "top_referrers",
+        "Channel": "top_channels",
+        "Source": "top_sources",
+        "Campaign": "top_campaigns",
+        "PopularPages": "top_pages", "Popular Pages": "top_pages",
+        "PageTitle": "top_page_titles", "Page Title": "top_page_titles",
+        "Country/Region": "top_countries", "Country": "top_countries",
+        "Browser": "top_browsers",
+        "OS": "top_os",
+    }
+    for metric_name, out_key in list_metrics.items():
+        rows = metrics_by_name.get(metric_name)
+        if rows and out_key not in result:
+            result[out_key] = _extract_top_list(rows)
+
+    # --- Friction / behavior signals ---
+    behavior_metrics = {
+        "DeadClickCount": "dead_clicks", "Dead Click Count": "dead_clicks",
+        "RageClickCount": "rage_clicks", "Rage Click Count": "rage_clicks",
+        "ExcessiveScroll": "excessive_scroll", "Excessive Scroll": "excessive_scroll",
+        "QuickbackClick": "quickback_clicks", "Quickback Click": "quickback_clicks",
+        "ScriptErrorCount": "script_errors", "Script Error Count": "script_errors",
+        "ErrorClickCount": "error_clicks", "Error Click Count": "error_clicks",
+    }
+    for metric_name, out_key in behavior_metrics.items():
+        rows = metrics_by_name.get(metric_name)
+        if rows and out_key not in result:
+            result[out_key] = _extract_rate_metric(rows)
+
+    return result
+
+
+async def fetch_clarity_insights(num_days: int = 1):
     """
-    Calls Clarity's Data Export API, grouped by device.
+    Calls Clarity's Data Export API once and returns (summary_dict, raw_payload).
     IMPORTANT: numOfDays is a rolling window of the last N*24 hours from the
     moment of the call — NOT a calendar day. We store the result against
     today's UTC date as a best-effort daily snapshot; it won't line up
     perfectly with midnight-to-midnight if the sync runs mid-day.
-    Bot sessions (totalBotSessionCount) are subtracted out.
     """
     if not CLARITY_API_TOKEN:
         raise HTTPException(500, "CLARITY_API_TOKEN is not configured")
@@ -297,31 +458,8 @@ async def fetch_clarity_device_sessions(num_days: int = 1) -> dict:
         raise HTTPException(resp.status_code, f"Clarity API error: {resp.text}")
 
     payload = resp.json()
-
-    total = desktop = mobile = other = 0
-    for metric in payload:
-        if metric.get("metricName") != "Traffic":
-            continue
-        for row in metric.get("information", []):
-            sessions = int(row.get("totalSessionCount", 0) or 0)
-            bots = int(row.get("totalBotSessionCount", 0) or 0)
-            real_sessions = max(sessions - bots, 0)
-            device = (row.get("Device") or "").strip().lower()
-
-            total += real_sessions
-            if device == "desktop":
-                desktop += real_sessions
-            elif device == "mobile":
-                mobile += real_sessions
-            else:
-                other += real_sessions  # tablet, other, unknown
-
-    return {
-        "total_sessions": total,
-        "desktop_sessions": desktop,
-        "mobile_sessions": mobile,
-        "other_sessions": other,
-    }
+    summary = summarize_clarity_payload(payload)
+    return summary, payload
 
 
 async def sync_clarity_sessions():
@@ -334,9 +472,10 @@ async def sync_clarity_sessions():
 
     last_error = None
     data = None
+    raw_payload = None
     for attempt in range(1, SYNC_MAX_RETRIES + 1):
         try:
-            data = await fetch_clarity_device_sessions(num_days=1)
+            data, raw_payload = await fetch_clarity_insights(num_days=1)
             break
         except Exception as e:
             last_error = e
@@ -354,6 +493,8 @@ async def sync_clarity_sessions():
 
     metrics = load_session_metrics()
     metrics[today] = data
+    # Overwritten (not accumulated) each sync — just a debug snapshot, not history.
+    metrics["_last_clarity_raw"] = {"date": today, "payload": raw_payload}
     save_session_metrics(metrics)
     print(f"[clarity-sync] saved sessions for {today}: {data}")
 
@@ -367,11 +508,22 @@ async def sync_clarity_now(authorized: bool = Depends(require_auth)):
     return {"status": "synced", "date": today, "data": metrics.get(today)}
 
 
+@app.get("/api/sessions/debug-clarity-raw")
+async def debug_clarity_raw(authorized: bool = Depends(require_auth)):
+    """Raw Clarity API response from the most recent sync — for verifying field names."""
+    metrics = load_session_metrics()
+    raw = metrics.get("_last_clarity_raw")
+    if not raw:
+        raise HTTPException(404, "No raw Clarity payload cached yet — run a sync first.")
+    return raw
+
+
 @app.get("/api/sessions")
 async def get_sessions(authorized: bool = Depends(require_auth)):
-    """Full daily session record, sorted oldest to newest."""
+    """Full daily session record, sorted oldest to newest (internal debug key excluded)."""
     metrics = load_session_metrics()
-    return dict(sorted(metrics.items()))
+    dated = {k: v for k, v in metrics.items() if not k.startswith("_")}
+    return dict(sorted(dated.items()))
 
 
 def _empty_bucket():
