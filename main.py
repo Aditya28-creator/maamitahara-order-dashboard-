@@ -1,15 +1,18 @@
 import os
 import json
 import secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -22,9 +25,38 @@ DASHBOARD_USER = os.environ.get("DASHBOARD_USER")
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS")
 API_VERSION = "2025-07"
 
-TOKEN_FILE = os.path.join(os.path.dirname(__file__), "tokens.json")
+CLARITY_API_TOKEN = os.environ.get("CLARITY_API_TOKEN", "")
 
-app = FastAPI()
+TOKEN_FILE = os.path.join(os.path.dirname(__file__), "tokens.json")
+# NOTE: same directory/pattern as tokens.json. If you're on Railway with an
+# ephemeral filesystem, mount a persistent volume at /data and point both
+# TOKEN_FILE and SESSIONS_FILE there, or this resets on every redeploy.
+SESSIONS_FILE = os.path.join(os.path.dirname(__file__), "session_metrics.json")
+
+scheduler = AsyncIOScheduler()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if CLARITY_API_TOKEN:
+        # Run once immediately on startup, then every 24 hours.
+        scheduler.add_job(
+            sync_clarity_sessions,
+            "interval",
+            hours=24,
+            next_run_time=datetime.utcnow(),
+            id="clarity_daily_sync",
+            replace_existing=True,
+        )
+        scheduler.start()
+    else:
+        print("[clarity-sync] CLARITY_API_TOKEN not set — automatic sync disabled, manual entry still works.")
+    yield
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+
+
+app = FastAPI(lifespan=lifespan)
 security = HTTPBasic()
 
 
@@ -43,6 +75,18 @@ def save_tokens(tokens):
 def get_token_for_shop(shop: str):
     tokens = load_tokens()
     return tokens.get(shop)
+
+
+def load_session_metrics():
+    if os.path.exists(SESSIONS_FILE):
+        with open(SESSIONS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_session_metrics(metrics):
+    with open(SESSIONS_FILE, "w") as f:
+        json.dump(metrics, f, indent=2)
 
 
 def require_auth(credentials: HTTPBasicCredentials = Depends(security)):
@@ -214,6 +258,139 @@ def classify_order(order: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Session metrics
+#   - Auto-synced from Microsoft Clarity's Data Export API (preferred)
+#   - Manual entry stays available as a fallback / for backfilling old dates
+#     that predate your Clarity install (Clarity has no history export either)
+# ---------------------------------------------------------------------------
+
+class SessionEntry(BaseModel):
+    date: str          # "YYYY-MM-DD"
+    total_sessions: int
+    desktop_sessions: int
+    mobile_sessions: int
+
+
+async def fetch_clarity_device_sessions(num_days: int = 1) -> dict:
+    """
+    Calls Clarity's Data Export API, grouped by device.
+    IMPORTANT: numOfDays is a rolling window of the last N*24 hours from the
+    moment of the call — NOT a calendar day. We store the result against
+    today's UTC date as a best-effort daily snapshot; it won't line up
+    perfectly with midnight-to-midnight if the sync runs mid-day.
+    Bot sessions (totalBotSessionCount) are subtracted out.
+    """
+    if not CLARITY_API_TOKEN:
+        raise HTTPException(500, "CLARITY_API_TOKEN is not configured")
+
+    url = "https://www.clarity.ms/export-data/api/v1/project-live-insights"
+    params = {"numOfDays": str(num_days), "dimension1": "Device"}
+    headers = {
+        "Authorization": f"Bearer {CLARITY_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, params=params, headers=headers)
+
+    if resp.status_code == 429:
+        raise HTTPException(429, "Clarity API daily rate limit hit (10 requests/project/day). Try again tomorrow.")
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, f"Clarity API error: {resp.text}")
+
+    payload = resp.json()
+
+    total = desktop = mobile = other = 0
+    for metric in payload:
+        if metric.get("metricName") != "Traffic":
+            continue
+        for row in metric.get("information", []):
+            sessions = int(row.get("totalSessionCount", 0) or 0)
+            bots = int(row.get("totalBotSessionCount", 0) or 0)
+            real_sessions = max(sessions - bots, 0)
+            device = (row.get("Device") or "").strip().lower()
+
+            total += real_sessions
+            if device == "desktop":
+                desktop += real_sessions
+            elif device == "mobile":
+                mobile += real_sessions
+            else:
+                other += real_sessions  # tablet, other, unknown
+
+    return {
+        "total_sessions": total,
+        "desktop_sessions": desktop,
+        "mobile_sessions": mobile,
+        "other_sessions": other,
+    }
+
+
+async def sync_clarity_sessions():
+    """Background job: pull latest Clarity data and save it under today's date."""
+    try:
+        data = await fetch_clarity_device_sessions(num_days=1)
+    except Exception as e:
+        print(f"[clarity-sync] failed: {e}")
+        return
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    data["source"] = "clarity"
+    data["synced_at"] = datetime.utcnow().isoformat() + "Z"
+
+    metrics = load_session_metrics()
+    metrics[today] = data
+    save_session_metrics(metrics)
+    print(f"[clarity-sync] saved sessions for {today}: {data}")
+
+
+@app.post("/api/sessions/sync-clarity")
+async def sync_clarity_now(authorized: bool = Depends(require_auth)):
+    """Manual trigger — lets you test the connection without waiting for the daily job."""
+    await sync_clarity_sessions()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    metrics = load_session_metrics()
+    return {"status": "synced", "date": today, "data": metrics.get(today)}
+
+
+@app.post("/api/sessions")
+async def save_session(entry: SessionEntry, authorized: bool = Depends(require_auth)):
+    try:
+        datetime.fromisoformat(entry.date)
+    except ValueError:
+        raise HTTPException(400, "date must be in YYYY-MM-DD format")
+
+    if entry.desktop_sessions + entry.mobile_sessions > entry.total_sessions:
+        raise HTTPException(400, "desktop_sessions + mobile_sessions cannot exceed total_sessions")
+
+    metrics = load_session_metrics()
+    metrics[entry.date] = {
+        "total_sessions": entry.total_sessions,
+        "desktop_sessions": entry.desktop_sessions,
+        "mobile_sessions": entry.mobile_sessions,
+        "other_sessions": entry.total_sessions - entry.desktop_sessions - entry.mobile_sessions,
+        "source": "manual",
+    }
+    save_session_metrics(metrics)
+    return {"status": "saved", "date": entry.date, "data": metrics[entry.date]}
+
+
+@app.get("/api/sessions")
+async def get_sessions(authorized: bool = Depends(require_auth)):
+    return load_session_metrics()
+
+
+@app.delete("/api/sessions/{date}")
+async def delete_session(date: str, authorized: bool = Depends(require_auth)):
+    metrics = load_session_metrics()
+    if date in metrics:
+        del metrics[date]
+        save_session_metrics(metrics)
+        return {"status": "deleted", "date": date}
+    raise HTTPException(404, f"No session entry for {date}")
+
+
+# ---------------------------------------------------------------------------
 # Data API
 # ---------------------------------------------------------------------------
 
@@ -316,6 +493,16 @@ async def api_orders(
         })
 
     daily_totals_sorted = dict(sorted(daily_totals.items()))
+
+    # Merge in manually-entered session data + derived conversion rate
+    session_metrics = load_session_metrics()
+    for day, entry in daily_totals_sorted.items():
+        sm = session_metrics.get(day)
+        entry["sessions"] = sm  # None if not entered yet
+        if sm and sm.get("total_sessions"):
+            entry["conversion_rate"] = round((entry["orders"] / sm["total_sessions"]) * 100, 2)
+        else:
+            entry["conversion_rate"] = None
 
     return JSONResponse({
         "shop": shop,
