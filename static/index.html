@@ -140,6 +140,53 @@
   </div>
 </div>
 
+<div class="grid three" id="behaviorGrid">
+  <div class="card">
+    <h2>Pages / Session</h2>
+    <div class="stat small" id="statPagesPerSession">—</div>
+  </div>
+  <div class="card">
+    <h2>Avg. Scroll Depth</h2>
+    <div class="stat small" id="statScrollDepth">—</div>
+  </div>
+  <div class="card">
+    <h2>Avg. Active Time</h2>
+    <div class="stat small" id="statActiveTime">—</div>
+  </div>
+</div>
+
+<div class="grid" id="topListsGrid" style="display:none;">
+  <div class="card">
+    <h2>Top Referrers (Today)</h2>
+    <table id="topReferrersTable">
+      <thead><tr><th>Referrer</th><th>Sessions</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Top Channels (Today)</h2>
+    <table id="topChannelsTable">
+      <thead><tr><th>Channel</th><th>Sessions</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="grid three" id="frictionGrid" style="display:none;">
+  <div class="card">
+    <h2>Rage Clicks</h2>
+    <div class="stat small" id="statRageClicks">—</div>
+  </div>
+  <div class="card">
+    <h2>Dead Clicks</h2>
+    <div class="stat small" id="statDeadClicks">—</div>
+  </div>
+  <div class="card">
+    <h2>Excessive Scrolling</h2>
+    <div class="stat small" id="statExcessiveScroll">—</div>
+  </div>
+</div>
+
 <div id="content">
   <div class="loading">Loading orders…</div>
 </div>
@@ -250,6 +297,51 @@ function renderSessionSummary(data) {
   document.getElementById('sum30').textContent = l30.total_sessions || '—';
   document.getElementById('sum30Sub').textContent =
     `${l30.days_with_data}/30 days recorded · Desktop ${l30.desktop_sessions} · Mobile ${l30.mobile_sessions}`;
+
+  renderTodayDetail(t && !t.no_data ? t : null);
+}
+
+function fillTable(tbodyId, items, labelFallback) {
+  const tbody = document.querySelector(`#${tbodyId} tbody`);
+  if (!items || !items.length) {
+    tbody.innerHTML = `<tr><td colspan="2" class="missing">${labelFallback}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = items.map(i =>
+    `<tr><td>${i.label}</td><td>${i.sessions}</td></tr>`
+  ).join('');
+}
+
+function fmtRate(metric) {
+  if (!metric || metric.pct === null || metric.pct === undefined) return '—';
+  return `${metric.pct}%${metric.sessions ? ` · ${metric.sessions} sessions` : ''}`;
+}
+
+function renderTodayDetail(t) {
+  // Pages / session, scroll depth, active time
+  document.getElementById('statPagesPerSession').textContent =
+    t && t.pages_per_session != null ? t.pages_per_session : '—';
+  document.getElementById('statScrollDepth').textContent =
+    t && t.scroll_depth_pct != null ? `${t.scroll_depth_pct}%` : '—';
+  document.getElementById('statActiveTime').textContent =
+    t && t.active_time_seconds != null ? `${Math.round(t.active_time_seconds)} sec` : '—';
+
+  // Top referrers / channels — only show the card row if we actually got data
+  const hasLists = t && (t.top_referrers || t.top_channels);
+  document.getElementById('topListsGrid').style.display = hasLists ? '' : 'none';
+  if (hasLists) {
+    fillTable('topReferrersTable', t.top_referrers, 'No referrer data yet');
+    fillTable('topChannelsTable', t.top_channels, 'No channel data yet');
+  }
+
+  // Friction metrics — only show if Clarity returned at least one of these
+  const hasFriction = t && (t.rage_clicks || t.dead_clicks || t.excessive_scroll);
+  document.getElementById('frictionGrid').style.display = hasFriction ? '' : 'none';
+  if (hasFriction) {
+    document.getElementById('statRageClicks').textContent = fmtRate(t.rage_clicks);
+    document.getElementById('statDeadClicks').textContent = fmtRate(t.dead_clicks);
+    document.getElementById('statExcessiveScroll').textContent = fmtRate(t.excessive_scroll);
+  }
 }
 
 async function syncClarityNow() {
