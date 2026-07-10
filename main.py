@@ -361,7 +361,7 @@ def summarize_clarity_payload(payload: list) -> dict:
         device = (row.get("Device") or "").strip().lower()
 
         total += real_sessions
-        if device == "desktop":
+        if device in ("desktop", "pc"):
             desktop += real_sessions
         elif device == "mobile":
             mobile += real_sessions
