@@ -12,7 +12,6 @@ from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
-from pydantic import BaseModel
 
 load_dotenv()
 
@@ -33,6 +32,11 @@ TOKEN_FILE = os.path.join(os.path.dirname(__file__), "tokens.json")
 # TOKEN_FILE and SESSIONS_FILE there, or this resets on every redeploy.
 SESSIONS_FILE = os.path.join(os.path.dirname(__file__), "session_metrics.json")
 
+# How many times to retry a failed Clarity sync before giving up for the day,
+# and how long to wait between retries.
+SYNC_MAX_RETRIES = 3
+SYNC_RETRY_DELAY_SECONDS = 300  # 5 minutes
+
 scheduler = AsyncIOScheduler()
 
 
@@ -50,7 +54,7 @@ async def lifespan(app: FastAPI):
         )
         scheduler.start()
     else:
-        print("[clarity-sync] CLARITY_API_TOKEN not set — automatic sync disabled, manual entry still works.")
+        print("[clarity-sync] CLARITY_API_TOKEN not set — automatic sync disabled.")
     yield
     if scheduler.running:
         scheduler.shutdown(wait=False)
@@ -258,18 +262,12 @@ def classify_order(order: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Session metrics
-#   - Auto-synced from Microsoft Clarity's Data Export API (preferred)
-#   - Manual entry stays available as a fallback / for backfilling old dates
-#     that predate your Clarity install (Clarity has no history export either)
+# Session metrics — auto-synced daily from Microsoft Clarity's Data Export
+# API. No manual entry: the record builds forward one day at a time from
+# whenever CLARITY_API_TOKEN was first configured. Days before that (or any
+# day the sync genuinely couldn't reach Clarity after retries) simply have
+# no entry — Clarity has no historical export to backfill from anyway.
 # ---------------------------------------------------------------------------
-
-class SessionEntry(BaseModel):
-    date: str          # "YYYY-MM-DD"
-    total_sessions: int
-    desktop_sessions: int
-    mobile_sessions: int
-
 
 async def fetch_clarity_device_sessions(num_days: int = 1) -> dict:
     """
@@ -327,11 +325,27 @@ async def fetch_clarity_device_sessions(num_days: int = 1) -> dict:
 
 
 async def sync_clarity_sessions():
-    """Background job: pull latest Clarity data and save it under today's date."""
-    try:
-        data = await fetch_clarity_device_sessions(num_days=1)
-    except Exception as e:
-        print(f"[clarity-sync] failed: {e}")
+    """
+    Background job: pull latest Clarity data and save it under today's date.
+    Retries a few times on failure (Clarity can be flaky / rate-limited)
+    before giving up for today — the job will simply try again tomorrow.
+    """
+    import asyncio
+
+    last_error = None
+    data = None
+    for attempt in range(1, SYNC_MAX_RETRIES + 1):
+        try:
+            data = await fetch_clarity_device_sessions(num_days=1)
+            break
+        except Exception as e:
+            last_error = e
+            print(f"[clarity-sync] attempt {attempt}/{SYNC_MAX_RETRIES} failed: {e}")
+            if attempt < SYNC_MAX_RETRIES:
+                await asyncio.sleep(SYNC_RETRY_DELAY_SECONDS)
+
+    if data is None:
+        print(f"[clarity-sync] giving up for today after {SYNC_MAX_RETRIES} attempts: {last_error}")
         return
 
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -353,41 +367,47 @@ async def sync_clarity_now(authorized: bool = Depends(require_auth)):
     return {"status": "synced", "date": today, "data": metrics.get(today)}
 
 
-@app.post("/api/sessions")
-async def save_session(entry: SessionEntry, authorized: bool = Depends(require_auth)):
-    try:
-        datetime.fromisoformat(entry.date)
-    except ValueError:
-        raise HTTPException(400, "date must be in YYYY-MM-DD format")
-
-    if entry.desktop_sessions + entry.mobile_sessions > entry.total_sessions:
-        raise HTTPException(400, "desktop_sessions + mobile_sessions cannot exceed total_sessions")
-
-    metrics = load_session_metrics()
-    metrics[entry.date] = {
-        "total_sessions": entry.total_sessions,
-        "desktop_sessions": entry.desktop_sessions,
-        "mobile_sessions": entry.mobile_sessions,
-        "other_sessions": entry.total_sessions - entry.desktop_sessions - entry.mobile_sessions,
-        "source": "manual",
-    }
-    save_session_metrics(metrics)
-    return {"status": "saved", "date": entry.date, "data": metrics[entry.date]}
-
-
 @app.get("/api/sessions")
 async def get_sessions(authorized: bool = Depends(require_auth)):
-    return load_session_metrics()
-
-
-@app.delete("/api/sessions/{date}")
-async def delete_session(date: str, authorized: bool = Depends(require_auth)):
+    """Full daily session record, sorted oldest to newest."""
     metrics = load_session_metrics()
-    if date in metrics:
-        del metrics[date]
-        save_session_metrics(metrics)
-        return {"status": "deleted", "date": date}
-    raise HTTPException(404, f"No session entry for {date}")
+    return dict(sorted(metrics.items()))
+
+
+def _empty_bucket():
+    return {"total_sessions": 0, "desktop_sessions": 0, "mobile_sessions": 0, "other_sessions": 0}
+
+
+@app.get("/api/sessions/summary")
+async def get_sessions_summary(authorized: bool = Depends(require_auth)):
+    """Today / Yesterday / Last 30 days, independent of the orders date window."""
+    metrics = load_session_metrics()
+
+    today_key = datetime.utcnow().strftime("%Y-%m-%d")
+    yesterday_key = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    today = metrics.get(today_key)
+    yesterday = metrics.get(yesterday_key)
+
+    last_30 = _empty_bucket()
+    days_with_data = 0
+    for i in range(30):
+        day_key = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
+        entry = metrics.get(day_key)
+        if not entry:
+            continue
+        days_with_data += 1
+        last_30["total_sessions"] += entry.get("total_sessions", 0)
+        last_30["desktop_sessions"] += entry.get("desktop_sessions", 0)
+        last_30["mobile_sessions"] += entry.get("mobile_sessions", 0)
+        last_30["other_sessions"] += entry.get("other_sessions", 0)
+    last_30["days_with_data"] = days_with_data
+
+    return {
+        "today": {"date": today_key, **(today or {})} if today else {"date": today_key, "no_data": True},
+        "yesterday": {"date": yesterday_key, **(yesterday or {})} if yesterday else {"date": yesterday_key, "no_data": True},
+        "last_30_days": last_30,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -494,11 +514,11 @@ async def api_orders(
 
     daily_totals_sorted = dict(sorted(daily_totals.items()))
 
-    # Merge in manually-entered session data + derived conversion rate
+    # Merge in session data (Clarity auto-synced) + derived conversion rate
     session_metrics = load_session_metrics()
     for day, entry in daily_totals_sorted.items():
         sm = session_metrics.get(day)
-        entry["sessions"] = sm  # None if not entered yet
+        entry["sessions"] = sm  # None if Clarity has no entry for that date
         if sm and sm.get("total_sessions"):
             entry["conversion_rate"] = round((entry["orders"] / sm["total_sessions"]) * 100, 2)
         else:
