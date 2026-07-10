@@ -41,7 +41,8 @@
   .custom-range { display: none; align-items: center; gap: 8px; }
   .custom-range.active { display: flex; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
-  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .grid.three { grid-template-columns: 1fr 1fr 1fr; }
+  @media (max-width: 800px) { .grid, .grid.three { grid-template-columns: 1fr; } }
   .card {
     background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px;
   }
@@ -51,6 +52,7 @@
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 500; }
   .stat { font-size: 28px; font-weight: 700; }
+  .stat.small { font-size: 22px; }
   .error { color: #f87171; padding: 16px; background: #2a1515; border-radius: 8px; }
   .success { color: #10b981; padding: 10px 16px; background: #132a1f; border-radius: 8px; margin-bottom: 12px; font-size: 13px; }
   .loading { color: var(--muted); padding: 20px; }
@@ -68,8 +70,6 @@
   .badge-organic { color: #10b981; }
   .scroll-table { max-height: 420px; overflow-y: auto; }
   .missing { color: #6b7280; font-style: italic; }
-  .session-form { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
-  .session-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
   .device-bar { display: flex; height: 6px; border-radius: 4px; overflow: hidden; width: 100px; background: #262b36; }
   .device-bar .desktop { background: var(--accent); }
   .device-bar .mobile { background: #f59e0b; }
@@ -80,6 +80,7 @@
   .source-clarity { background: #132a1f; color: #10b981; }
   .source-manual { background: #262b36; color: var(--muted); }
   .clarity-sync-row { display: flex; align-items: center; gap: 12px; margin-top: 4px; }
+  .no-data-note { color: var(--muted); font-size: 12px; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -109,32 +110,33 @@
 
 <div class="grid">
   <div class="card full">
-    <h2>Add / update daily sessions</h2>
+    <h2>Sessions (Microsoft Clarity)</h2>
     <div class="sub" style="margin-bottom:12px;">
-      Sessions now auto-sync daily from Microsoft Clarity. Use manual entry below only to
-      backfill dates from before Clarity was installed, or if a sync was missed.
+      Sessions sync automatically once a day. This record builds forward day by day —
+      there's no manual entry, so any date before syncing started will simply have no data.
     </div>
     <div class="clarity-sync-row">
       <button onclick="syncClarityNow()" id="syncBtn">Sync from Clarity now</button>
       <span class="sub" id="clarityStatus"></span>
     </div>
-    <hr style="border-color: var(--border); margin: 16px 0;" />
-    <div id="sessionFormMsg"></div>
-    <div class="session-form">
-      <label>Date
-        <input type="date" id="sf_date" />
-      </label>
-      <label>Total sessions
-        <input type="number" id="sf_total" min="0" />
-      </label>
-      <label>Desktop
-        <input type="number" id="sf_desktop" min="0" />
-      </label>
-      <label>Mobile
-        <input type="number" id="sf_mobile" min="0" />
-      </label>
-      <button onclick="saveSession()">Save manually</button>
-    </div>
+  </div>
+</div>
+
+<div class="grid three" id="sessionSummaryGrid">
+  <div class="card">
+    <h2>Today</h2>
+    <div class="stat small" id="sumToday">—</div>
+    <div class="sub" id="sumTodaySub" style="margin-top:6px;"></div>
+  </div>
+  <div class="card">
+    <h2>Yesterday</h2>
+    <div class="stat small" id="sumYesterday">—</div>
+    <div class="sub" id="sumYesterdaySub" style="margin-top:6px;"></div>
+  </div>
+  <div class="card">
+    <h2>Last 30 Days</h2>
+    <div class="stat small" id="sum30">—</div>
+    <div class="sub" id="sum30Sub" style="margin-top:6px;"></div>
   </div>
 </div>
 
@@ -203,45 +205,51 @@ async function loadData() {
   } catch (err) {
     content.innerHTML = `<div class="error">Error loading orders: ${err.message}</div>`;
   }
+
+  loadSessionSummary();
 }
 
-async function saveSession() {
-  const msgEl = document.getElementById('sessionFormMsg');
-  msgEl.innerHTML = '';
-
-  const date = document.getElementById('sf_date').value;
-  const total = document.getElementById('sf_total').value;
-  const desktop = document.getElementById('sf_desktop').value;
-  const mobile = document.getElementById('sf_mobile').value;
-
-  if (!date || total === '' || desktop === '' || mobile === '') {
-    msgEl.innerHTML = `<div class="error">Fill in date, total, desktop and mobile before saving.</div>`;
-    return;
-  }
-
+async function loadSessionSummary() {
   try {
-    const res = await fetch('/api/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        date,
-        total_sessions: parseInt(total, 10),
-        desktop_sessions: parseInt(desktop, 10),
-        mobile_sessions: parseInt(mobile, 10),
-      }),
-    });
+    const res = await fetch('/api/sessions/summary');
     if (!res.ok) {
       const errText = await res.text();
       throw new Error(errText);
     }
-    msgEl.innerHTML = `<div class="success">Saved sessions for ${date}.</div>`;
-    document.getElementById('sf_total').value = '';
-    document.getElementById('sf_desktop').value = '';
-    document.getElementById('sf_mobile').value = '';
-    loadData();
+    const data = await res.json();
+    renderSessionSummary(data);
   } catch (err) {
-    msgEl.innerHTML = `<div class="error">Error saving: ${err.message}</div>`;
+    document.getElementById('sumToday').textContent = '—';
+    document.getElementById('sumTodaySub').textContent = `Error: ${err.message}`;
   }
+}
+
+function renderSessionSummary(data) {
+  const t = data.today;
+  const y = data.yesterday;
+  const l30 = data.last_30_days;
+
+  if (t && !t.no_data) {
+    document.getElementById('sumToday').textContent = t.total_sessions;
+    document.getElementById('sumTodaySub').textContent =
+      `Desktop ${t.desktop_sessions} · Mobile ${t.mobile_sessions}`;
+  } else {
+    document.getElementById('sumToday').textContent = '—';
+    document.getElementById('sumTodaySub').textContent = 'Not synced yet';
+  }
+
+  if (y && !y.no_data) {
+    document.getElementById('sumYesterday').textContent = y.total_sessions;
+    document.getElementById('sumYesterdaySub').textContent =
+      `Desktop ${y.desktop_sessions} · Mobile ${y.mobile_sessions}`;
+  } else {
+    document.getElementById('sumYesterday').textContent = '—';
+    document.getElementById('sumYesterdaySub').textContent = 'No data for this date';
+  }
+
+  document.getElementById('sum30').textContent = l30.total_sessions || '—';
+  document.getElementById('sum30Sub').textContent =
+    `${l30.days_with_data}/30 days recorded · Desktop ${l30.desktop_sessions} · Mobile ${l30.mobile_sessions}`;
 }
 
 async function syncClarityNow() {
@@ -264,12 +272,6 @@ async function syncClarityNow() {
   } finally {
     btn.disabled = false;
   }
-}
-
-function prefillSessionForm(day) {
-  document.getElementById('sf_date').value = day;
-  document.getElementById('sf_total').focus();
-  window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
 function render(data) {
@@ -339,7 +341,7 @@ function render(data) {
         </div>`;
       convCell = d.conversion_rate !== null ? `${d.conversion_rate}%` : '—';
     } else {
-      sessionsCell = `<span class="missing" onclick="prefillSessionForm('${day}')" style="cursor:pointer;">+ add</span>`;
+      sessionsCell = `<span class="missing">no data</span>`;
       deviceCell = '<span class="missing">—</span>';
       convCell = '<span class="missing">—</span>';
     }
@@ -378,14 +380,14 @@ function render(data) {
     </div>
     <div class="grid">
       <div class="card">
-        <h2>Total Sessions <span style="font-weight:400;">(${daysWithSessions}/${days.length} days entered)</span></h2>
+        <h2>Total Sessions <span style="font-weight:400;">(${daysWithSessions}/${days.length} days recorded)</span></h2>
         <div class="stat">${totalSessions || '—'}</div>
         <div class="sub" style="margin-top:6px;">Desktop ${totalDesktop} · Mobile ${totalMobile}</div>
       </div>
       <div class="card">
         <h2>Conversion Rate</h2>
         <div class="stat">${overallConvRate !== null ? overallConvRate + '%' : '—'}</div>
-        <div class="sub" style="margin-top:6px;">Orders ÷ sessions, across days with data entered</div>
+        <div class="sub" style="margin-top:6px;">Orders ÷ sessions, across days with data recorded</div>
       </div>
     </div>
     <div class="grid">
