@@ -462,11 +462,27 @@ async def fetch_clarity_insights(num_days: int = 1):
     return summary, payload
 
 
+async def _save_clarity_result(data: dict, raw_payload):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    data["source"] = "clarity"
+    data["synced_at"] = datetime.utcnow().isoformat() + "Z"
+
+    metrics = load_session_metrics()
+    metrics[today] = data
+    # Overwritten (not accumulated) each sync — just a debug snapshot, not history.
+    metrics["_last_clarity_raw"] = {"date": today, "payload": raw_payload}
+    save_session_metrics(metrics)
+    print(f"[clarity-sync] saved sessions for {today}: {data}")
+    return today
+
+
 async def sync_clarity_sessions():
     """
     Background job: pull latest Clarity data and save it under today's date.
-    Retries a few times on failure (Clarity can be flaky / rate-limited)
-    before giving up for today — the job will simply try again tomorrow.
+    Retries a few times on failure (Clarity can be flaky / rate-limited),
+    5 minutes apart, before giving up for today — the job will simply try
+    again on tomorrow's run. This deliberately slow backoff is fine here
+    because nothing is waiting on it synchronously.
     """
     import asyncio
 
@@ -487,23 +503,24 @@ async def sync_clarity_sessions():
         print(f"[clarity-sync] giving up for today after {SYNC_MAX_RETRIES} attempts: {last_error}")
         return
 
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    data["source"] = "clarity"
-    data["synced_at"] = datetime.utcnow().isoformat() + "Z"
-
-    metrics = load_session_metrics()
-    metrics[today] = data
-    # Overwritten (not accumulated) each sync — just a debug snapshot, not history.
-    metrics["_last_clarity_raw"] = {"date": today, "payload": raw_payload}
-    save_session_metrics(metrics)
-    print(f"[clarity-sync] saved sessions for {today}: {data}")
+    await _save_clarity_result(data, raw_payload)
 
 
 @app.post("/api/sessions/sync-clarity")
 async def sync_clarity_now(authorized: bool = Depends(require_auth)):
-    """Manual trigger — lets you test the connection without waiting for the daily job."""
-    await sync_clarity_sessions()
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    """
+    Manual trigger from the dashboard button. Tries exactly once and reports
+    back immediately (no multi-minute retry/backoff) — someone is actively
+    waiting on this, unlike the silent daily background job.
+    """
+    try:
+        data, raw_payload = await fetch_clarity_insights(num_days=1)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(502, f"Clarity sync failed: {e}")
+
+    today = await _save_clarity_result(data, raw_payload)
     metrics = load_session_metrics()
     return {"status": "synced", "date": today, "data": metrics.get(today)}
 
