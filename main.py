@@ -145,7 +145,7 @@ async def auth_callback(request: Request):
             },
         )
         if resp.status_code != 200:
-        raise HTTPException(400, f"Failed to get access token: {resp.text}")
+            raise HTTPException(400, f"Failed to get access token: {resp.text}")
 
     data = resp.json()
     access_token = data.get("access_token")
