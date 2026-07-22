@@ -144,6 +144,11 @@ async def auth_callback(request: Request):
                 "code": code,
             },
         )
+        print("=" * 60)
+print("STATUS:", resp.status_code)
+print("BODY:")
+print(resp.text)
+print("=" * 60)
     if resp.status_code != 200:
         raise HTTPException(400, f"Failed to get access token: {resp.text}")
 
