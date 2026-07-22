@@ -144,7 +144,7 @@ async def auth_callback(request: Request):
                 "code": code,
             },
         )
-        print("=" * 60)
+print("=" * 60)
 print("STATUS:", resp.status_code)
 print("BODY:")
 print(resp.text)
